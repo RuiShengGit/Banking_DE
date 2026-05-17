@@ -1,0 +1,420 @@
+import time
+import psycopg2
+from decimal import Decimal, ROUND_DOWN
+from faker import Faker
+import random
+import argparse
+import sys
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# -----------------------------
+# Project configuration
+# -----------------------------
+NUM_CUSTOMERS = 10
+ACCOUNTS_PER_CUSTOMER = 2
+NUM_TRANSACTIONS = 50
+
+MAX_TXN_AMOUNT = Decimal("1000.00")
+CURRENCY = "SGD"
+
+INITIAL_BALANCE_MIN = Decimal("10.00")
+INITIAL_BALANCE_MAX = Decimal("1000.00")
+
+DEFAULT_LOOP = True
+SLEEP_SECONDS = 2
+
+ADD_NEW_CUSTOMERS_ENABLED = True
+NEW_CUSTOMER_PROBABILITY = 0.05
+NEW_CUSTOMERS_PER_BATCH = 1
+MAX_CUSTOMERS = 100
+
+# -----------------------------
+# CLI override
+# -----------------------------
+parser = argparse.ArgumentParser(description="Run fake banking data generator")
+parser.add_argument("--once", action="store_true", help="Run a single iteration and exit")
+args = parser.parse_args()
+
+LOOP = not args.once and DEFAULT_LOOP
+
+# -----------------------------
+# Helpers
+# -----------------------------
+fake = Faker()
+
+
+def random_money(min_val: Decimal, max_val: Decimal) -> Decimal:
+    """
+    Generate random money safely using cents instead of float.
+    """
+    min_cents = int(min_val * 100)
+    max_cents = int(max_val * 100)
+
+    if max_cents < min_cents:
+        return Decimal("0.00")
+
+    cents = random.randint(min_cents, max_cents)
+    return (Decimal(cents) / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def get_required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
+
+
+def create_customer_with_accounts():
+    first_name = fake.first_name()
+    last_name = fake.last_name()
+    email = f"{fake.user_name()}.{random.randint(100000, 999999)}@example.com"
+
+    cur.execute(
+        """
+        INSERT INTO customers (first_name, last_name, email)
+        VALUES (%s, %s, %s)
+        RETURNING id
+        """,
+        (first_name, last_name, email),
+    )
+
+    customer_id = cur.fetchone()[0]
+
+    account_ids = []
+
+    for _ in range(ACCOUNTS_PER_CUSTOMER):
+        account_type = random.choice(["SAVINGS", "CHECKING"])
+        initial_balance = random_money(INITIAL_BALANCE_MIN, INITIAL_BALANCE_MAX)
+
+        cur.execute(
+            """
+            INSERT INTO accounts (customer_id, account_type, balance, currency)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (customer_id, account_type, initial_balance, CURRENCY),
+        )
+
+        account_id = cur.fetchone()[0]
+        account_ids.append(account_id)
+
+    return customer_id, account_ids
+
+# -----------------------------
+# Connect to Postgres
+# -----------------------------
+conn = psycopg2.connect(
+    host=get_required_env("POSTGRES_HOST"),
+    port=get_required_env("POSTGRES_PORT"),
+    dbname=get_required_env("POSTGRES_DB"),
+    user=get_required_env("POSTGRES_USER"),
+    password=get_required_env("POSTGRES_PASSWORD"),
+)
+
+conn.autocommit = False
+cur = conn.cursor()
+
+
+# -----------------------------
+# Seed customers and accounts once
+# -----------------------------
+def create_tables_if_not_exists():
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            id SERIAL PRIMARY KEY,
+            first_name VARCHAR(100) NOT NULL,
+            last_name VARCHAR(100) NOT NULL,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS accounts (
+            id SERIAL PRIMARY KEY,
+            customer_id INTEGER NOT NULL REFERENCES customers(id),
+            account_type VARCHAR(50) NOT NULL,
+            balance NUMERIC(12, 2) NOT NULL DEFAULT 0.00,
+            currency VARCHAR(10) NOT NULL DEFAULT 'SGD',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id SERIAL PRIMARY KEY,
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            txn_type VARCHAR(50) NOT NULL,
+            amount NUMERIC(12, 2) NOT NULL,
+            related_account_id INTEGER REFERENCES accounts(id),
+            status VARCHAR(50) NOT NULL DEFAULT 'COMPLETED',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
+def ensure_seed_data():
+    """
+    Creates initial customers and accounts only if there are no accounts yet.
+    """
+    cur.execute("SELECT COUNT(*) FROM accounts")
+    account_count = cur.fetchone()[0]
+
+    if account_count > 0:
+        print(f"Existing accounts found: {account_count}. Skipping initial seeding.")
+        return
+
+    total_accounts_created = 0
+
+    for _ in range(NUM_CUSTOMERS):
+        _, account_ids = create_customer_with_accounts()
+        total_accounts_created += len(account_ids)
+
+    print(f"Seeded {NUM_CUSTOMERS} customers and {total_accounts_created} accounts.")
+
+
+def add_new_customers_if_enabled():
+    """
+    Occasionally adds new customers and accounts.
+    Transactions still reuse all existing accounts.
+    """
+    if not ADD_NEW_CUSTOMERS_ENABLED:
+        return
+
+    cur.execute("SELECT COUNT(*) FROM customers")
+    customer_count = cur.fetchone()[0]
+
+    if customer_count >= MAX_CUSTOMERS:
+        print(f"Customer limit reached: {customer_count}. No new customers added.")
+        return
+
+    should_add_customer = random.random() < NEW_CUSTOMER_PROBABILITY
+
+    if not should_add_customer:
+        print("No new customers added this iteration.")
+        return
+
+    customers_created = 0
+    accounts_created = 0
+
+    for _ in range(NEW_CUSTOMERS_PER_BATCH):
+        if customer_count + customers_created >= MAX_CUSTOMERS:
+            break
+
+        _, account_ids = create_customer_with_accounts()
+        customers_created += 1
+        accounts_created += len(account_ids)
+
+    print(
+        f"Added {customers_created} new customer(s) "
+        f"and {accounts_created} new account(s)."
+    )
+
+# -----------------------------
+# Fetch existing accounts
+# -----------------------------
+def get_account_ids():
+    cur.execute(
+        """
+        SELECT id
+        FROM accounts
+        WHERE currency = %s
+        ORDER BY id
+        """,
+        (CURRENCY,),
+    )
+
+    return [row[0] for row in cur.fetchall()]
+
+
+# -----------------------------
+# Transaction generators
+# -----------------------------
+def create_deposit(account_id):
+    amount = random_money(Decimal("1.00"), MAX_TXN_AMOUNT)
+
+    cur.execute(
+        """
+        UPDATE accounts
+        SET balance = balance + %s
+        WHERE id = %s
+        """,
+        (amount, account_id),
+    )
+
+    cur.execute(
+        """
+        INSERT INTO transactions (account_id, txn_type, amount, related_account_id, status)
+        VALUES (%s, 'DEPOSIT', %s, NULL, 'COMPLETED')
+        """,
+        (account_id, amount),
+    )
+
+
+def create_withdrawal(account_id):
+    cur.execute(
+        """
+        SELECT balance
+        FROM accounts
+        WHERE id = %s
+        FOR UPDATE
+        """,
+        (account_id,),
+    )
+
+    balance = cur.fetchone()[0]
+
+    if balance < Decimal("1.00"):
+        create_deposit(account_id)
+        return
+
+    max_amount = min(balance, MAX_TXN_AMOUNT)
+    amount = random_money(Decimal("1.00"), max_amount)
+
+    cur.execute(
+        """
+        UPDATE accounts
+        SET balance = balance - %s
+        WHERE id = %s
+        """,
+        (amount, account_id),
+    )
+
+    cur.execute(
+        """
+        INSERT INTO transactions (account_id, txn_type, amount, related_account_id, status)
+        VALUES (%s, 'WITHDRAWAL', %s, NULL, 'COMPLETED')
+        """,
+        (account_id, amount),
+    )
+
+
+def create_transfer(from_account_id, to_account_id):
+    # Lock both accounts in fixed order to avoid deadlocks if multiple generators run
+    first_id = min(from_account_id, to_account_id)
+    second_id = max(from_account_id, to_account_id)
+
+    cur.execute(
+        """
+        SELECT id, balance
+        FROM accounts
+        WHERE id IN (%s, %s)
+        ORDER BY id
+        FOR UPDATE
+        """,
+        (first_id, second_id),
+    )
+
+    rows = cur.fetchall()
+    balances = {row[0]: row[1] for row in rows}
+
+    from_balance = balances[from_account_id]
+
+    if from_balance < Decimal("1.00"):
+        create_deposit(from_account_id)
+        return
+
+    max_amount = min(from_balance, MAX_TXN_AMOUNT)
+    amount = random_money(Decimal("1.00"), max_amount)
+
+    cur.execute(
+        """
+        UPDATE accounts
+        SET balance = balance - %s
+        WHERE id = %s
+        """,
+        (amount, from_account_id),
+    )
+
+    cur.execute(
+        """
+        UPDATE accounts
+        SET balance = balance + %s
+        WHERE id = %s
+        """,
+        (amount, to_account_id),
+    )
+
+    cur.execute(
+        """
+        INSERT INTO transactions (account_id, txn_type, amount, related_account_id, status)
+        VALUES (%s, 'TRANSFER', %s, %s, 'COMPLETED')
+        """,
+        (from_account_id, amount, to_account_id),
+    )
+
+
+# -----------------------------
+# Core generation logic
+# -----------------------------
+def run_iteration():
+    accounts = get_account_ids()
+
+    if not accounts:
+        raise RuntimeError("No accounts found. Seeding may have failed.")
+
+    txn_types = ["DEPOSIT", "WITHDRAWAL", "TRANSFER"]
+
+    for _ in range(NUM_TRANSACTIONS):
+        txn_type = random.choice(txn_types)
+
+        if txn_type == "DEPOSIT":
+            account_id = random.choice(accounts)
+            create_deposit(account_id)
+
+        elif txn_type == "WITHDRAWAL":
+            account_id = random.choice(accounts)
+            create_withdrawal(account_id)
+
+        elif txn_type == "TRANSFER":
+            if len(accounts) < 2:
+                account_id = random.choice(accounts)
+                create_deposit(account_id)
+            else:
+                from_account_id, to_account_id = random.sample(accounts, 2)
+                create_transfer(from_account_id, to_account_id)
+
+    print(f"Generated {NUM_TRANSACTIONS} transactions using {len(accounts)} existing accounts.")
+
+
+# -----------------------------
+# Main loop
+# -----------------------------
+try:
+    create_tables_if_not_exists()
+    conn.commit()
+
+    ensure_seed_data()
+    conn.commit()
+
+    iteration = 0
+
+    while True:
+        iteration += 1
+        print(f"\n--- Iteration {iteration} started ---")
+
+        try:
+            add_new_customers_if_enabled()
+            run_iteration()
+            conn.commit()
+            print(f"--- Iteration {iteration} finished ---")
+
+        except Exception as e:
+            conn.rollback()
+            print(f"Iteration {iteration} failed. Rolled back changes.")
+            print(f"Error: {e}")
+
+        if not LOOP:
+            break
+
+        time.sleep(SLEEP_SECONDS)
+
+except KeyboardInterrupt:
+    print("\nInterrupted by user. Exiting gracefully...")
+
+finally:
+    cur.close()
+    conn.close()

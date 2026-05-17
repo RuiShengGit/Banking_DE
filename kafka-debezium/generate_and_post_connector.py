@@ -15,18 +15,18 @@ connector_config = {
     "name": "postgres-connector",
     "config": {
         "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
-        "database.hostname": os.getenv("POSTGRES_HOST"),
-        "database.port": os.getenv("POSTGRES_PORT"),
-        "database.user": os.getenv("POSTGRES_USER"),
-        "database.password": os.getenv("POSTGRES_PASSWORD"),
-        "database.dbname": os.getenv("POSTGRES_DB"),
+        "database.hostname": "postgres",
+        "database.port": "5432",
+        "database.user": "postgres",
+        "database.password": "postgres",
+        "database.dbname": "banking_de",
         "topic.prefix": "banking_server",
-        "table.include.list": "public.customers,public.accounts,public.transactions",
         "plugin.name": "pgoutput",
-        "slot.name": "banking_slot",
-        "publication.autocreate.mode": "filtered",
-        "tombstones.on.delete": "false",
-        "decimal.handling.mode": "double",
+        "publication.autocreate.mode": "all_tables",
+        "table.include.list": "public.customers,public.accounts,public.transactions",
+        "slot.name": "debezium_slot",
+        "publication.name": "dbz_publication",
+        "decimal.handling.mode": "double"
     },
 }
 
@@ -47,3 +47,5 @@ elif response.status_code == 409:
     print("⚠️ Connector already exists.")
 else:
     print(f"❌ Failed to create connector ({response.status_code}): {response.text}")
+
+
